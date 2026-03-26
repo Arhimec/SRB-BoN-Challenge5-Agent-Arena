@@ -1,4 +1,3 @@
-// FILE: tsconfig.json
 {
   "compilerOptions": {
     "target": "ES2020",
@@ -10,5 +9,5 @@
     "resolveJsonModule": true,
     "skipLibCheck": true
   },
-  "include": ["src", "dashboard", "scripts", "tests"]
+  "include": ["src", "dashboard", "scripts"]
 }
