@@ -1,0 +1,432 @@
+// FILE: dashboard/server.ts
+import express from 'express';
+import http from 'http';
+import WebSocket from 'ws';
+import { DASHBOARD_PORT } from '../src/config';
+import { getAllAgentMetrics, computeGuildMetrics, updateAgentMetrics } from './metricsHub';
+import { getBonHealth } from './bonHealth';
+import { prometheusHandler } from './prometheus';
+import { getGlobalState, getAdminContext } from '../src/globalState';
+import { getGuildFeeSpent } from '../src/globalFee';
+import { log } from '../src/logger';
+
+export { updateAgentMetrics };
+
+export function startDashboardServer() {
+  const app = express();
+  const server = http.createServer(app);
+  const wss = new WebSocket.Server({ server });
+
+  app.get('/metrics', prometheusHandler);
+
+  app.get('/bon-health', async (_req, res) => {
+    const health = await getBonHealth();
+    res.json(health);
+  });
+
+  wss.on('connection', ws => {
+    const sendSnapshot = async () => {
+      const agents = getAllAgentMetrics();
+      const guild = computeGuildMetrics();
+      const health = await getBonHealth();
+      const globalState = getGlobalState();
+      const admin = getAdminContext();
+      const guildFeeSpent = getGuildFeeSpent();
+      ws.send(
+        JSON.stringify({
+          type: 'snapshot',
+          agents,
+          guild,
+          health,
+          globalState,
+          admin,
+          guildFeeSpent,
+        })
+      );
+    };
+    sendSnapshot();
+    const id = setInterval(sendSnapshot, 1000);
+    ws.on('close', () => clearInterval(id));
+  });
+
+  server.listen(DASHBOARD_PORT, () => {
+    log([dashboard] listening on ${DASHBOARD_PORT});
+  });
+}
+
+// FILE: dashboard/web/package.json
+{
+  "name": "guild-dashboard",
+  "version": "1.0.0",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "^18.3.0",
+    "react-dom": "^18.3.0",
+    "recharts": "^2.12.7"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.0",
+    "@types/react-dom": "^18.3.0",
+    "typescript": "^5.6.0",
+    "vite": "^5.4.0"
+  }
+}
+
+// FILE: dashboard/web/index.html
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Guild Agents Dashboard</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+
+// FILE: dashboard/web/tsconfig.json
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "ESNext",
+    "jsx": "react-jsx",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true
+  },
+  "include": ["src"]
+}
+
+// FILE: dashboard/web/src/main.tsx
+import React from 'react';
+import ReactDOM from 'react-dom/client';
+import App from './App';
+
+ReactDOM.createRoot(document.getElementById('root') as HTMLElement).render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>
+);
+
+// FILE: dashboard/web/src/App.tsx
+import React, { useEffect, useState } from 'react';
+import GuildSummary from './components/GuildSummary';
+import AgentGrid from './components/AgentGrid';
+import Alerts from './components/Alerts';
+import Charts from './components/Charts';
+import BonHealth from './components/BonHealth';
+
+const App: React.FC = () => {
+  const [snapshot, setSnapshot] = useState<any | null>(null);
+
+  useEffect(() => {
+    const ws = new WebSocket(ws://${window.location.hostname}:4000);
+    ws.onmessage = ev => {
+      const data = JSON.parse(ev.data);
+      if (data.type === 'snapshot') setSnapshot(data);
+    };
+    return () => ws.close();
+  }, []);
+
+  if (!snapshot) return <div>Loading dashboard…</div>;
+  return (
+    <div style={{ display: 'flex', gap: 16, padding: 16, fontFamily: 'sans-serif', background: '#111', color: '#eee' }}>
+      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 16 }}>
+        <GuildSummary guild={snapshot.guild} globalState={snapshot.globalState} admin={snapshot.admin} guildFeeSpent={snapshot.guildFeeSpent} />
+        <BonHealth />
+        <Alerts agents={snapshot.agents} guildFeeSpent={snapshot.guildFeeSpent} />
+      </div>
+      <div style={{ flex: 2, display: 'flex', flexDirection: 'column', gap: 16 }}>
+        <AgentGrid agents={snapshot.agents} />
+        <Charts agents={snapshot.agents} />
+      </div>
+    </div>
+  );
+};
+
+export default App;
+
+// FILE: dashboard/web/src/components/GuildSummary.tsx
+import React from 'react';
+
+interface Props {
+  guild: { totalScore: number; totalFeeSpent: number; activeAgents: number };
+  globalState: 'GREEN' | 'RED';
+  admin: any;
+  guildFeeSpent: number;
+}
+
+const GuildSummary: React.FC<Props> = ({ guild, globalState, admin, guildFeeSpent }) => {
+  return (
+    <div style={{ border: '1px solid #333', borderRadius: 4, padding: 8 }}>
+      <h3>Guild Summary</h3>
+      <p>Total score: {guild.totalScore}</p>
+      <p>Fee spent: {guildFeeSpent.toFixed(3)} / 500 EGLD</p>
+      <p>Active agents: {guild.activeAgents}</p>
+      <p>
+        Global state:{' '}
+        <strong style={{ color: globalState === 'GREEN' ? '#00ff88' : '#ff3366' }}>{globalState}</strong>
+      </p>
+      <p>Last admin: {admin.lastAdminMessage  '-'}</p>
+      <p>
+        Intent: {admin.lastAdminIntent  '-'} ({admin.lastAdminConfidence?.toFixed(2)  '0.00'})
+      </p>
+    </div>
+  );
+};
+
+export default GuildSummary;
+
+// FILE: dashboard/web/src/components/AgentGrid.tsx
+import React from 'react';
+import AgentCard from './AgentCard';
+
+const AgentGrid: React.FC<{ agents: any[] }> = ({ agents }) => (
+  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))', gap: 8 }}>
+    {agents.map(a => (
+      <AgentCard key={a.id} agent={a} />
+    ))}
+  </div>
+);
+
+export default AgentGrid;
+
+// FILE: dashboard/web/src/components/AgentCard.tsx
+import React from 'react';
+
+const AgentCard: React.FC<{ agent: any }> = ({ agent }) => {
+  return (
+    <div style={{ border: '1px solid #333', borderRadius: 4, padding: 8 }}>
+      <h4>{agent.id}</h4>
+      <p>
+        State:{' '}
+        <strong style={{ color: agent.state === 'GREEN' ? '#00ff88' : '#ff3366' }}>{agent.state}</strong>
+      </p>
+      <p>Score: {agent.score}</p>
+      <p>Fee: {agent.feeSpent.toFixed(3)}</p>
+      <p>Permitted: {agent.permitted}</p>
+      <p>Unpermitted: {agent.unpermitted}</p>
+      <p>Last error: {agent.lastError  '-'}</p>
+    </div>
+  );
+};
+
+export default AgentCard;
+
+// FILE: dashboard/web/src/components/Alerts.tsx
+import React from 'react';
+
+const Alerts: React.FC<{ agents: any[]; guildFeeSpent: number }> = ({ agents, guildFeeSpent }) => {
+  const leaks = agents.filter(a => a.unpermitted > 0);
+  const highFee = guildFeeSpent > 480;
+  return (
+    <div style={{ border: '1px solid #333', borderRadius: 4, padding: 8 }}>
+      <h3>Alerts</h3>
+      {leaks.length === 0 && !highFee && <p>No alerts.</p>}
+      {leaks.length > 0 && (
+        <ul>
+          {leaks.map(a => (
+            <li key={a.id} style={{ color: '#ff3366' }}>
+              Leak: {a.id} has {a.unpermitted} unpermitted txs
+            </li>
+          ))}
+        </ul>
+      )}
+      {highFee && <p style={{ color: '#ffcc00' }}>Fee usage high: {guildFeeSpent.toFixed(3)} / 500 EGLD</p>}
+    </div>
+  );
+};
+
+export default Alerts;
+
+// FILE: dashboard/web/src/components/Charts.tsx
+import React from 'react';
+
+const Charts: React.FC<{ agents: any[] }> = () => {
+  return (
+    <div style={{ border: '1px solid #333', borderRadius: 4, padding: 8 }}>
+      <h3>Charts</h3>
+      <p>Placeholder: hook Recharts here for TPS/score over time.</p>
+    </div>
+  );
+};
+
+export default Charts;
+
+// FILE: dashboard/web/src/components/BonHealth.tsx
+import React, { useEffect, useState } from 'react';
+interface BonHealthState {
+  explorerOk: boolean;
+  gatewayOk: boolean;
+  checkedAt: number;
+}
+
+const BonHealth: React.FC = () => {
+  const [health, setHealth] = useState<BonHealthState | null>(null);
+
+  useEffect(() => {
+    const fetchHealth = async () => {
+      try {
+        const res = await fetch('/bon-health');
+        const data = await res.json();
+        setHealth(data);
+      } catch {
+        setHealth(null);
+      }
+    };
+    fetchHealth();
+    const id = setInterval(fetchHealth, 5000);
+    return () => clearInterval(id);
+  }, []);
+
+  const pill = (ok: boolean) => ({
+    display: 'inline-block',
+    width: 10,
+    height: 10,
+    borderRadius: '50%',
+    background: ok ? '#00ff88' : '#ff3366',
+    marginRight: 6,
+  });
+
+  if (!health) return <div>BoN health: loading…</div>;
+
+  return (
+    <div style={{ border: '1px solid #333', borderRadius: 4, padding: 8 }}>
+      <h3>BoN Health</h3>
+      <p>
+        <span style={pill(health.explorerOk)} />
+        Explorer: {health.explorerOk ? 'OK' : 'DOWN'}
+      </p>
+      <p>
+        <span style={pill(health.gatewayOk)} />
+        Gateway: {health.gatewayOk ? 'OK' : 'DOWN'}
+      </p>
+      <p style={{ fontSize: 11, opacity: 0.7 }}>
+        Checked: {new Date(health.checkedAt).toLocaleTimeString()}
+      </p>
+    </div>
+  );
+};
+
+export default BonHealth;
+
+// FILE: scripts/bon_connectivity_test.ts
+import { BON_EXPLORER_API, BON_GATEWAY_API, ADMIN_ADDRESS, TARGET_ADDRESS, SIMULATION_MODE } from '../src/config';
+import fetch from 'node-fetch';
+import { log } from '../src/logger';
+
+async function testExplorer() {
+  log('Testing Explorer...');
+  const url = ${BON_EXPLORER_API}/accounts/${TARGET_ADDRESS}/transactions?size=5&sort=desc;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(Explorer error: ${res.status});
+  const txs = await res.json();
+  log(Explorer OK, got ${txs.length} txs);
+  const adminTxs = txs.filter((tx: any) => tx.sender === ADMIN_ADDRESS);
+  log(Admin→TARGET txs: ${adminTxs.length});
+}
+
+async function testGateway() {
+  log('Testing Gateway...');
+  const fake = {
+    nonce: 0,
+    value: '0',
+    receiver: TARGET_ADDRESS,
+    sender: ADMIN_ADDRESS,
+    gasPrice: 1000000000,
+    gasLimit: 50000,
+    chainID: 'D',
+    signature: 'SIM_SIGNATURE',
+  };
+  if (SIMULATION_MODE) {
+    log('SIMULATION_MODE=true, not sending real tx');
+    log(JSON.stringify(fake, null, 2));
+    return;
+  }
+  const res = await fetch(${BON_GATEWAY_API}/transaction/send, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(fake),
+  });
+  if (!res.ok) throw new Error(Gateway error: ${res.status} ${await res.text()});
+  const body = await res.json();
+  log('Gateway OK, txHash:', body.data?.txHash);
+}
+
+async function main() {
+  try {
+    await testExplorer();
+    await testGateway();
+    log('All connectivity tests passed');
+  } catch (e: any) {
+    log('Connectivity test failed:', e.message || e);
+  }
+}
+
+main();
+
+// FILE: Dockerfile
+FROM node:20-alpine
+
+WORKDIR /app
+COPY package*.json ./
+RUN npm install
+COPY . .
+RUN npm run build
+CMD ["node", "dist/index.js"]
+
+// FILE: dashboard/web/Dockerfile
+FROM node:20-alpine AS build
+WORKDIR /app
+COPY package*.json ./
+RUN npm install
+COPY . .
+RUN npm run build
+
+FROM nginx:alpine
+COPY --from=build /app/dist /usr/share/nginx/html
+EXPOSE 80
+CMD ["nginx", "-g", "daemon off;"]
+
+// FILE: docker-compose.yml
+version: "3.9"
+services:
+  orchestrator:
+    build: .
+    container_name: guild-orchestrator
+    env_file: .env
+    restart: always
+    ports:
+      - "4000:4000"
+  dashboard:
+    build: ./dashboard/web
+    container_name: guild-dashboard
+    restart: always
+    ports:
+      - "5173:80"
+
+// FILE: .github/workflows/deploy.yml
+name: Deploy Guild Agents
+
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm install
+      - run: npm test
+      - run: npm run build
+      - run: cd dashboard/web && npm install && npm run build
