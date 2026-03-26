@@ -1,0 +1,162 @@
+// FILE: package.json
+{
+  "name": "guild-agents-bon",
+  "version": "1.0.0",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "ts-node src/index.ts",
+    "test": "jest"
+  },
+  "dependencies": {
+    "@multiversx/sdk-core": "^11.0.0",
+    "express": "^4.19.0",
+    "ws": "^8.16.0",
+    "node-fetch": "^3.3.2",
+    "prom-client": "^15.0.0"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/jest": "^29.5.12",
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.10",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.2.5",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.6.0"
+  }
+}
+
+// FILE: tsconfig.json
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "CommonJS",
+    "outDir": "dist",
+    "rootDir": ".",
+    "strict": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "skipLibCheck": true
+  },
+  "include": ["src", "dashboard", "scripts", "tests"]
+}
+
+// FILE: .env.example
+BON_EXPLORER_API=https://bon-explorer.multiversx.com
+BON_GATEWAY_API=https://gateway.battleofnodes.com
+ADMIN_ADDRESS=erd1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+TARGET_ADDRESS=erd1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+LLM_ENDPOINT=http://localhost:8080/classify-intent
+SIMULATION_MODE=false
+DASHBOARD_PORT=4000
+LOG_LEVEL=info
+
+// FILE: src/logger.ts
+export function log(...args: any[]) {
+  console.log(new Date().toISOString(), ...args);
+}
+
+// FILE: src/types.ts
+export type LightState = 'GREEN' | 'RED';
+export interface ClassificationResult {
+  intent: 'GREEN' | 'RED' | 'NO_CHANGE';
+  confidence: number;
+}
+export interface AgentMetrics {
+  id: string;
+  state: LightState;
+  permitted: number;
+  unpermitted: number;
+  score: number;
+  feeSpent: number;
+  tps: number;
+  lastAdminMessage?: string;
+  lastAdminIntent?: string;
+  lastAdminConfidence?: number;
+  lastTxAt?: number;
+  lastError?: string;
+  updatedAt: number;
+}
+
+// FILE: src/config.ts
+import 'dotenv/config';
+
+export const BON_EXPLORER_API = process.env.BON_EXPLORER_API  'https://bon-explorer.multiversx.com';
+export const BON_GATEWAY_API = process.env.BON_GATEWAY_API  'https://gateway.battleofnodes.com';
+export const ADMIN_ADDRESS = process.env.ADMIN_ADDRESS  '';
+export const TARGET_ADDRESS = process.env.TARGET_ADDRESS  '';
+export const LLM_ENDPOINT = process.env.LLM_ENDPOINT  'http://localhost:8080/classify-intent';
+export const SIMULATION_MODE = process.env.SIMULATION_MODE === 'true';
+export const DASHBOARD_PORT = Number(process.env.DASHBOARD_PORT  4000);
+
+// FILE: src/globalState.ts
+import { LightState } from './types';
+
+let currentState: LightState = 'RED';
+let lastAdminMessage: string | undefined;
+let lastAdminIntent: 'GREEN' | 'RED' | 'NO_CHANGE' | undefined;
+let lastAdminConfidence: number | undefined;
+let lastAdminAt: number | undefined;
+
+export function getGlobalState() {
+  return currentState;
+}
+
+export function setGlobalState(state: LightState) {
+  currentState = state;
+}
+
+export function updateAdminContext(
+  message: string,
+  intent: 'GREEN' | 'RED' | 'NO_CHANGE',
+  confidence: number
+) {
+  lastAdminMessage = message;
+  lastAdminIntent = intent;
+  lastAdminConfidence = confidence;
+  lastAdminAt = Date.now();
+}
+
+export function getAdminContext() {
+  return {
+    lastAdminMessage,
+    lastAdminIntent,
+    lastAdminConfidence,
+    lastAdminAt,
+  };
+}
+
+// FILE: src/globalFee.ts
+const GUILD_FEE_LIMIT_EGLD = 500;
+let guildFeeSpent = 0;
+
+export function addGuildFee(amount: number) {
+  guildFeeSpent += amount;
+}
+
+export function getGuildFeeSpent() {
+  return guildFeeSpent;
+}
+
+export function guildFeeLimitReached() {
+  return guildFeeSpent >= GUILD_FEE_LIMIT_EGLD;
+}
+
+// FILE: src/bonNetwork.ts
+import fetch from 'node-fetch';
+import { BON_GATEWAY_API } from './config';
+import { log } from './logger';
+
+export interface BonNetworkConfig {
+  chainID: string;
+  minGasPrice: number;
+  gasPerDataByte: number;
+  defaultGasLimit: number;
+}
+
+let cachedConfig: BonNetworkConfig | null = null;
+
+export async function loadBonNetworkConfig(): Promise<BonNetworkConfig> {
+  if (cachedConfig) return cachedConfig;
