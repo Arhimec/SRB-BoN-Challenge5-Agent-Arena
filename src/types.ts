@@ -1,4 +1,3 @@
-// FILE: src/types.ts
 export type LightState = 'GREEN' | 'RED';
 export interface ClassificationResult {
   intent: 'GREEN' | 'RED' | 'NO_CHANGE';

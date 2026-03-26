@@ -1,17 +1,10 @@
-// FILE: src/sharedListener.ts
 import fetch from 'node-fetch';
 import { BON_EXPLORER_API, ADMIN_ADDRESS, TARGET_ADDRESS } from './config';
 import { log } from './logger';
 
-let lastTimestamp = 0;
-
-interface ExplorerTx {
-  txHash: string;
-  sender: string;
-  receiver: string;
-  data?: string;
-  timestamp: number;
-}
+// C4 FIX: txHash-based dedup instead of timestamp (same-block commands were missed)
+const seenHashes = new Set<string>();
+const MAX_SEEN = 2000;
 
 export interface AdminCommand {
   txHash: string;
@@ -21,26 +14,53 @@ export interface AdminCommand {
 
 export async function pollAdminCommands(): Promise<AdminCommand[]> {
   const url = `${BON_EXPLORER_API}/accounts/${TARGET_ADDRESS}/transactions?size=50&sort=desc`;
-  const res = await fetch(url);
-  if (!res.ok) {
-    log('[listener] error fetching txs', res.status);
+  let res: any;
+  try {
+    res = await fetch(url);
+  } catch (err: any) {
+    log('[listener] fetch error:', err.message);
     return [];
   }
 
-  const txs: ExplorerTx[] = await res.json();
+  if (!res.ok) {
+    log('[listener] HTTP error:', res.status);
+    return [];
+  }
+
+  let txs: any[];
+  try {
+    txs = await res.json();
+  } catch {
+    log('[listener] JSON parse error');
+    return [];
+  }
+
+  if (!Array.isArray(txs)) return [];
+
   const cmds: AdminCommand[] = [];
 
   for (const tx of txs) {
+    // H5 FIX: Filter BOTH sender AND receiver
     if (tx.sender !== ADMIN_ADDRESS) continue;
-    if (tx.timestamp <= lastTimestamp) continue;
+    if (tx.receiver !== TARGET_ADDRESS) continue;
+
+    // C4 FIX: txHash-based dedup (not timestamp)
+    if (seenHashes.has(tx.txHash)) continue;
+    seenHashes.add(tx.txHash);
+
     const msg = tx.data ? Buffer.from(tx.data, 'base64').toString('utf8') : '';
+    if (!msg.trim()) continue; // skip empty data txs
+
     cmds.push({ txHash: tx.txHash, timestamp: tx.timestamp, message: msg });
   }
 
-  if (cmds.length > 0) {
-    const maxTs = Math.max(...cmds.map(c => c.timestamp));
-    lastTimestamp = Math.max(lastTimestamp, maxTs);
+  // Trim seen set to prevent unbounded growth
+  if (seenHashes.size > MAX_SEEN) {
+    const arr = Array.from(seenHashes);
+    seenHashes.clear();
+    for (const h of arr.slice(-1000)) seenHashes.add(h);
   }
 
+  // Return in chronological order (oldest first)
   return cmds.reverse();
 }

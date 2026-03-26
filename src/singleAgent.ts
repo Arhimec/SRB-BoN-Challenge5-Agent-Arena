@@ -1,5 +1,5 @@
-// FILE: src/singleAgent.ts
 import { txLoopFactory } from './txEngine';
+import { getGlobalState, getAdminContext } from './globalState';
 import { AgentMetrics } from './types';
 
 export interface AgentConfig {
@@ -7,31 +7,30 @@ export interface AgentConfig {
   address: string;
   privateKey: string;
   feeLimitEgld: number;
-  role: 'sprinter' | 'steady' | 'sniper';
+  batchSize?: number;
 }
 
 export type AgentMetricsSink = (metrics: AgentMetrics) => void;
+
 export function startAgent(cfg: AgentConfig, report: AgentMetricsSink) {
-  let state: 'GREEN' | 'RED' = 'RED';
   let permitted = 0;
   let unpermitted = 0;
   let feeSpent = 0;
-  let lastAdminMessage: string | undefined;
-  let lastAdminIntent: any;
-  let lastAdminConfidence: number | undefined;
+  let rejected = 0;
   let lastTxAt: number | undefined;
   let lastError: string | undefined;
+  const startTime = Date.now();
 
   const txLoop = txLoopFactory({
     id: cfg.id,
     privateKey: cfg.privateKey,
     senderAddress: cfg.address,
     feeLimitEgld: cfg.feeLimitEgld,
-    role: cfg.role,
-    onTx: (fee, isPermitted) => {
+    batchSize: cfg.batchSize ?? 80,
+    onTx: (count, fee, rejectedCount) => {
       feeSpent += fee;
-      if (isPermitted) permitted++;
-      else unpermitted++;
+      permitted += count;
+      rejected += rejectedCount;
       lastTxAt = Date.now();
       pushMetrics();
     },
@@ -42,18 +41,20 @@ export function startAgent(cfg: AgentConfig, report: AgentMetricsSink) {
   });
 
   function pushMetrics() {
-    const score = permitted - unpermitted;
+    const admin = getAdminContext();
+    const elapsed = (Date.now() - startTime) / 1000;
     const metrics: AgentMetrics = {
       id: cfg.id,
-      state,
+      // M1 FIX: read state from globalState, not dead local variable
+      state: getGlobalState(),
       permitted,
       unpermitted,
-      score,
+      score: permitted - unpermitted,
       feeSpent,
-      tps: 0,
-      lastAdminMessage,
-      lastAdminIntent,
-      lastAdminConfidence,
+      tps: elapsed > 0 ? permitted / elapsed : 0,
+      lastAdminMessage: admin.lastAdminMessage,
+      lastAdminIntent: admin.lastAdminIntent,
+      lastAdminConfidence: admin.lastAdminConfidence,
       lastTxAt,
       lastError,
       updatedAt: Date.now(),
@@ -61,5 +62,9 @@ export function startAgent(cfg: AgentConfig, report: AgentMetricsSink) {
     report(metrics);
   }
 
-  txLoop();
+  // Start the tx loop
+  txLoop().catch(err => {
+    lastError = `txLoop crashed: ${err.message}`;
+    pushMetrics();
+  });
 }
