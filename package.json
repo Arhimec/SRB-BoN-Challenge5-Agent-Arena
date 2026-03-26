@@ -29,15 +29,7 @@
 }
 
 
-// FILE: .env.example
-BON_EXPLORER_API=https://bon-explorer.multiversx.com
-BON_GATEWAY_API=https://gateway.battleofnodes.com
-ADMIN_ADDRESS=erd1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-TARGET_ADDRESS=erd1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-LLM_ENDPOINT=http://localhost:8080/classify-intent
-SIMULATION_MODE=false
-DASHBOARD_PORT=4000
-LOG_LEVEL=info
+
 
 // FILE: src/logger.ts
 export function log(...args: any[]) {
