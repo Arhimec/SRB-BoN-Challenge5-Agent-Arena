@@ -1,0 +1,434 @@
+const res = await fetch(${BON_GATEWAY_API}/network/config);
+  if (!res.ok) throw new Error(BoN network config error: ${res.status});
+  const body = await res.json();
+  const cfg = body.data?.config  body.data  body;
+
+  cachedConfig = {
+    chainID: cfg.ChainID  cfg.chainID  'D',
+    minGasPrice: Number(cfg.MinGasPrice  cfg.minGasPrice  1000000000),
+    gasPerDataByte: Number(cfg.GasPerDataByte  cfg.gasPerDataByte  1500),
+    defaultGasLimit: Number(cfg.MinGasLimit  cfg.minGasLimit  50000),
+  };
+
+  log('[BoN] loaded network config:', cachedConfig);
+  return cachedConfig;
+}
+
+// FILE: src/bonSigner.ts
+import fetch from 'node-fetch';
+import { Address, Account, Transaction, TransactionPayload, UserSigner } from '@multiversx/sdk-core';
+import { BON_GATEWAY_API, TARGET_ADDRESS } from './config';
+import { loadBonNetworkConfig } from './bonNetwork';
+import { log } from './logger';
+
+export async function sendBonTx(
+  privateKeyHex: string,
+  senderBech32: string,
+  value: string,
+  data?: string
+) {
+  const cfg = await loadBonNetworkConfig();
+  const sender = new Address(senderBech32);
+  const account = new Account(sender);
+
+  const nonceRes = await fetch(${BON_GATEWAY_API}/address/${senderBech32});
+  if (!nonceRes.ok) throw new Error(Nonce fetch failed: ${nonceRes.status});
+  const nonceBody = await nonceRes.json();
+  account.nonce = BigInt(nonceBody.data?.account?.nonce  0);
+
+  const payload = data ? new TransactionPayload(data) : new TransactionPayload();
+  const tx = new Transaction({
+    nonce: account.nonce,
+    value,
+    receiver: new Address(TARGET_ADDRESS),
+    sender,
+    gasPrice: cfg.minGasPrice,
+    gasLimit: cfg.defaultGasLimit,
+    chainID: cfg.chainID,
+    data: payload,
+  });
+
+  const signer = UserSigner.fromSecretKey(Buffer.from(privateKeyHex, 'hex'));
+  await signer.sign(tx);
+  const raw = tx.toSendable();
+
+  const res = await fetch(`${BON_GATEWAY_API}/transaction/send`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(raw),
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`BoN tx send failed: ${res.status} ${text}`);
+  }
+
+  const body = await res.json();
+  const txHash = body.data?.txHash;
+  log('[BoN] tx sent:', txHash);
+  return txHash;
+}
+
+// FILE: src/sharedListener.ts
+import fetch from 'node-fetch';
+import { BON_EXPLORER_API, ADMIN_ADDRESS, TARGET_ADDRESS } from './config';
+import { log } from './logger';
+
+let lastTimestamp = 0;
+
+interface ExplorerTx {
+  txHash: string;
+  sender: string;
+  receiver: string;
+  data?: string;
+  timestamp: number;
+}
+
+export interface AdminCommand {
+  txHash: string;
+  timestamp: number;
+  message: string;
+}
+
+export async function pollAdminCommands(): Promise<AdminCommand[]> {
+  const url = `${BON_EXPLORER_API}/accounts/${TARGET_ADDRESS}/transactions?size=50&sort=desc`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    log('[listener] error fetching txs', res.status);
+    return [];
+  }
+
+  const txs: ExplorerTx[] = await res.json();
+  const cmds: AdminCommand[] = [];
+
+  for (const tx of txs) {
+    if (tx.sender !== ADMIN_ADDRESS) continue;
+    if (tx.timestamp <= lastTimestamp) continue;
+    const msg = tx.data ? Buffer.from(tx.data, 'base64').toString('utf8') : '';
+    cmds.push({ txHash: tx.txHash, timestamp: tx.timestamp, message: msg });
+  }
+
+  if (cmds.length > 0) {
+    const maxTs = Math.max(...cmds.map(c => c.timestamp));
+    lastTimestamp = Math.max(lastTimestamp, maxTs);
+  }
+
+  return cmds.reverse();
+}
+
+// FILE: src/classifier.ts
+import fetch from 'node-fetch';
+import { ClassificationResult } from './types';
+import { LLM_ENDPOINT } from './config';
+import { log } from './logger';
+
+const SYSTEM_PROMPT = `
+You are an intent classifier for a blockchain game.
+Decide if the admin message means:
+- GREEN: send as many transactions as possible.
+- RED: stop sending transactions.
+- NO_CHANGE: unrelated or ambiguous.
+
+Respond ONLY as JSON:
+{ "intent": "GREEN" | "RED" | "NO_CHANGE", "confidence": 0.0-1.0 }
+`.trim();
+
+async function callLLM(message: string, previousState: 'GREEN' | 'RED'): Promise<ClassificationResult> {
+  const userPrompt = `Current state: ${previousState}\nAdmin message: ${message}`;
+  const res = await fetch(LLM_ENDPOINT, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ systemPrompt: SYSTEM_PROMPT, userPrompt }),
+  });
+  if (!res.ok) throw new Error(`LLM error: ${res.status}`);
+  const text = await res.text();
+  const parsed = JSON.parse(text);
+  return { intent: parsed.intent, confidence: parsed.confidence };
+}
+
+export async function classifyAdminMessage(
+  message: string,
+  previousState: 'GREEN' | 'RED'
+): Promise<ClassificationResult> {
+  try {
+    const result = await callLLM(message, previousState);
+    log('[classifier]', { message, ...result, previousState });
+    return result;
+  } catch (err: any) {
+    log('[classifier] error, NO_CHANGE fallback', err.message  err);
+    return { intent: 'NO_CHANGE', confidence: 0 };
+  }
+}
+
+// FILE: src/commandLoop.ts
+import { pollAdminCommands } from './sharedListener';
+import { classifyAdminMessage } from './classifier';
+import { getGlobalState, setGlobalState, updateAdminContext } from './globalState';
+import { log } from './logger';
+
+export async function startCommandLoop() {
+  while (true) {
+    try {
+      const cmds = await pollAdminCommands();
+      for (const cmd of cmds) {
+        const prev = getGlobalState();
+        const res = await classifyAdminMessage(cmd.message, prev);
+        updateAdminContext(cmd.message, res.intent, res.confidence);
+        if (res.intent === 'GREEN' && prev !== 'GREEN') {
+          log('[state] switching to GREEN');
+          setGlobalState('GREEN');
+        } else if (res.intent === 'RED' && prev !== 'RED') {
+          log('[state] switching to RED');
+          setGlobalState('RED');
+        }
+      }
+    } catch (err: any) {
+      log('[commandLoop] error', err.message  err);
+    }
+    await new Promise(r => setTimeout(r, 1000));
+  }
+}
+
+// FILE: src/txEngine.ts
+import { log } from './logger';
+import { getGlobalState } from './globalState';
+import { addGuildFee, guildFeeLimitReached } from './globalFee';
+import { SIMULATION_MODE } from './config';
+import { sendBonTx } from './bonSigner';
+
+interface TxEngineConfig {
+  id: string;
+  privateKey: string;
+  senderAddress: string;
+  feeLimitEgld: number;
+  role: 'sprinter' | 'steady' | 'sniper';
+  onTx: (fee: number, isPermitted: boolean) => void;
+  onError: (err: string) => void;
+}
+
+export function txLoopFactory(cfg: TxEngineConfig) {
+  const baseDelay =
+    cfg.role === 'sprinter' ? 10 :
+    cfg.role === 'steady' ? 40 : 120;
+
+  let agentFeeSpent = 0;
+
+  async function sendSingleTx(): Promise<number> {
+    if (SIMULATION_MODE) {
+      const fee = 0.0001;
+      log(`[tx ${cfg.id}] SIM tx`);
+      return fee;
+    }
+    const fee = 0.0005;
+    await sendBonTx(cfg.privateKey, cfg.senderAddress, '0', undefined);
+    log(`[tx ${cfg.id}] real tx, fee=${fee}`);
+    return fee;
+  }
+
+  return async function txLoop() {
+    while (true) {
+      try {
+        if (guildFeeLimitReached()) {
+          await new Promise(r => setTimeout(r, 500));
+          continue;
+        }
+        if (agentFeeSpent >= cfg.feeLimitEgld) {
+          await new Promise(r => setTimeout(r, 500));
+          continue;
+        }
+        const state = getGlobalState();
+        if (state === 'RED') {
+          await new Promise(r => setTimeout(r, 100));
+          continue;
+        }
+        const fee = await sendSingleTx();
+        agentFeeSpent += fee;
+        addGuildFee(fee);
+        cfg.onTx(fee, true);
+        await new Promise(r => setTimeout(r, baseDelay));
+      } catch (err: any) {
+        cfg.onError(err.message  String(err));
+        await new Promise(r => setTimeout(r, 500));
+      }
+    }
+  };
+}
+
+// FILE: src/singleAgent.ts
+import { txLoopFactory } from './txEngine';
+import { AgentMetrics } from './types';
+
+export interface AgentConfig {
+  id: string;
+  address: string;
+  privateKey: string;
+  feeLimitEgld: number;
+  role: 'sprinter' | 'steady' | 'sniper';
+}
+
+export type AgentMetricsSink = (metrics: AgentMetrics) => void;
+export function startAgent(cfg: AgentConfig, report: AgentMetricsSink) {
+  let state: 'GREEN' | 'RED' = 'RED';
+  let permitted = 0;
+  let unpermitted = 0;
+  let feeSpent = 0;
+  let lastAdminMessage: string | undefined;
+  let lastAdminIntent: any;
+  let lastAdminConfidence: number | undefined;
+  let lastTxAt: number | undefined;
+  let lastError: string | undefined;
+
+  const txLoop = txLoopFactory({
+    id: cfg.id,
+    privateKey: cfg.privateKey,
+    senderAddress: cfg.address,
+    feeLimitEgld: cfg.feeLimitEgld,
+    role: cfg.role,
+    onTx: (fee, isPermitted) => {
+      feeSpent += fee;
+      if (isPermitted) permitted++;
+      else unpermitted++;
+      lastTxAt = Date.now();
+      pushMetrics();
+    },
+    onError: err => {
+      lastError = err;
+      pushMetrics();
+    },
+  });
+
+  function pushMetrics() {
+    const score = permitted - unpermitted;
+    const metrics: AgentMetrics = {
+      id: cfg.id,
+      state,
+      permitted,
+      unpermitted,
+      score,
+      feeSpent,
+      tps: 0,
+      lastAdminMessage,
+      lastAdminIntent,
+      lastAdminConfidence,
+      lastTxAt,
+      lastError,
+      updatedAt: Date.now(),
+    };
+    report(metrics);
+  }
+
+  txLoop();
+}
+
+// FILE: src/index.ts
+import fs from 'fs';
+import path from 'path';
+import { startCommandLoop } from './commandLoop';
+import { startAgent, AgentConfig } from './singleAgent';
+import { log } from './logger';
+import { startDashboardServer, updateAgentMetrics } from '../dashboard/server';
+
+async function main() {
+  const cfgPath = path.join(__dirname, '../config/agents.json');
+  const agents: AgentConfig[] = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+
+  startDashboardServer();
+  startCommandLoop();
+
+  for (const cfg of agents) {
+    startAgent(cfg, metrics => updateAgentMetrics(metrics));
+  }
+
+  log('[orchestrator] started');
+}
+
+main().catch(err => {
+  console.error(err);
+  process.exit(1);
+});
+
+// FILE: config/agents.json
+[
+  {
+    "id": "agent-1",
+    "address": "erd1...",
+    "privateKey": "HEX_PRIVATE_KEY_1",
+    "feeLimitEgld": 50,
+    "role": "sprinter"
+  }
+]
+
+// FILE: dashboard/metricsHub.ts
+import { AgentMetrics } from '../src/types';
+
+const agents = new Map<string, AgentMetrics>();
+
+export function updateAgentMetrics(metrics: AgentMetrics) {
+  agents.set(metrics.id, metrics);
+}
+
+export function getAllAgentMetrics() {
+  return Array.from(agents.values());
+}
+
+export function computeGuildMetrics() {
+  const list = getAllAgentMetrics();
+  const totalScore = list.reduce((s, a) => s + a.score, 0);
+  const totalFeeSpent = list.reduce((s, a) => s + a.feeSpent, 0);
+  const activeAgents = list.length;
+  return { totalScore, totalFeeSpent, activeAgents };
+}
+
+// FILE: dashboard/bonHealth.ts
+import fetch from 'node-fetch';
+import { BON_EXPLORER_API, BON_GATEWAY_API, TARGET_ADDRESS } from '../src/config';
+
+export async function getBonHealth() {
+  const now = Date.now();
+  let explorerOk = false;
+  let gatewayOk = false;
+
+  try {
+    const res = await fetch(${BON_EXPLORER_API}/accounts/${TARGET_ADDRESS}/transactions?size=1);
+    explorerOk = res.ok;
+  } catch {
+    explorerOk = false;
+  }
+
+  try {
+    const res = await fetch(${BON_GATEWAY_API}/network/config);
+    gatewayOk = res.ok;
+  } catch {
+    gatewayOk = false;
+  }
+
+  return { explorerOk, gatewayOk, checkedAt: now };
+}
+
+// FILE: dashboard/prometheus.ts
+import client from 'prom-client';
+import { computeGuildMetrics } from './metricsHub';
+
+const registry = new client.Registry();
+client.collectDefaultMetrics({ register: registry });
+
+const gauge = new client.Gauge({
+  name: 'guild_metrics',
+  help: 'Guild-wide metrics',
+  labelNames: ['metric'],
+});
+
+registry.registerMetric(gauge);
+
+export function updatePrometheus() {
+  const guild = computeGuildMetrics();
+  gauge.set({ metric: 'total_score' }, guild.totalScore);
+  gauge.set({ metric: 'total_fee' }, guild.totalFeeSpent);
+  gauge.set({ metric: 'active_agents' }, guild.activeAgents);
+}
+
+export function prometheusHandler(_req: any, res: any) {
+  updatePrometheus();
+  res.set('Content-Type', registry.contentType);
+  res.end(registry.metrics());
+}
